@@ -178,6 +178,11 @@ app.post("/api/admin/businesses/:id/plan", requireAuth, requireAdmin, (req, res)
   setBusinessPlan(req.params.id, plan);
   res.json({ ok: true });
 });
-
+app.get("/", (req, res) => {
+  res.json({
+    status: "ok",
+    message: "AI Business Manager backend is running"
+  });
+});
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`AI Business Manager backend running on :${port}`));
