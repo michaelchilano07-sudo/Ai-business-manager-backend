@@ -1,26 +1,52 @@
-const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
+const GEMINI_URL =
+  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
 
-async function callClaude(system, userText, maxTokens = 500) {
-  const res = await fetch(ANTHROPIC_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": process.env.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: "claude-sonnet-5",
-      max_tokens: maxTokens,
-      system,
-      messages: [{ role: "user", content: userText }],
-    }),
-  });
+async function callGemini(system, userText, maxTokens = 500) {
+  const res = await fetch(
+    `${GEMINI_URL}?key=${process.env.GEMINI_API_KEY}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        system_instruction: {
+          parts: [{ text: system }],
+        },
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: userText }],
+          },
+        ],
+        generationConfig: {
+          maxOutputTokens: maxTokens,
+        },
+      }),
+    }
+  );
+
   const data = await res.json();
-  return data?.content?.find((b) => b.type === "text")?.text || "";
+
+  if (!res.ok) {
+    console.error("Gemini API error:", data);
+    throw new Error(
+      data?.error?.message || "Gemini API request failed"
+    );
+  }
+
+  return (
+    data?.candidates?.[0]?.content?.parts
+      ?.map((part) => part.text || "")
+      .join("") || ""
+  );
 }
 
 const PARSE_SYSTEM = `You convert a small shop owner's plain sentence about a business event into JSON.
-Output ONLY valid JSON, no markdown fences, no commentary. Schema:
+
+Output ONLY valid JSON, no markdown fences, no commentary.
+
+Schema:
 {
   "type": "sale" | "expense" | "purchase" | "unknown",
   "item": string or null,
@@ -30,6 +56,7 @@ Output ONLY valid JSON, no markdown fences, no commentary. Schema:
   "amount_paid": number,
   "customer_name": string or null
 }
+
 Rules:
 - "sale" = the owner sold something to a customer.
 - "purchase" = the owner bought stock/inventory to resell later.
@@ -41,29 +68,70 @@ Rules:
 - If the sentence doesn't describe a business transaction, set type to "unknown".`;
 
 export async function parseEntry(text) {
-  const raw = await callClaude(PARSE_SYSTEM, text, 400);
+  const raw = await callGemini(PARSE_SYSTEM, text, 400);
+
   try {
     const clean = raw.replace(/```json|```/g, "").trim();
+
     const parsed = JSON.parse(clean);
-    if (parsed.total == null && parsed.quantity != null && parsed.unit_price != null) {
+
+    if (
+      parsed.total == null &&
+      parsed.quantity != null &&
+      parsed.unit_price != null
+    ) {
       parsed.total = parsed.quantity * parsed.unit_price;
     }
-    if (parsed.amount_paid == null) parsed.amount_paid = parsed.total || 0;
+
+    if (parsed.amount_paid == null) {
+      parsed.amount_paid = parsed.total || 0;
+    }
+
     return parsed;
-  } catch {
-    return { type: "unknown", item: null, quantity: null, unit_price: null, total: 0, amount_paid: 0, customer_name: null };
+  } catch (error) {
+    console.error("AI parsing error:", error);
+
+    return {
+      type: "unknown",
+      item: null,
+      quantity: null,
+      unit_price: null,
+      total: 0,
+      amount_paid: 0,
+      customer_name: null,
+    };
   }
 }
 
-const ASK_SYSTEM = `You are a small business's bookkeeping assistant. You will be given a JSON
-snapshot of REAL, already-computed numbers for this business (weekly/monthly sales, expenses,
-profit, top products, customer debts, inventory, estimated cash on hand), plus the owner's
-question in their own words. Answer using ONLY the numbers in the snapshot — never invent or
-estimate a number that isn't there. If the snapshot doesn't contain what's needed to answer
-(e.g. they ask about something with no data), say so plainly. Keep answers short — 2-4 sentences,
-plain language, no jargon. Currency symbol to use: `;
+const ASK_SYSTEM = `You are a small business's bookkeeping assistant.
 
-export async function answerQuestion(question, snapshot, currency = "K") {
-  const prompt = `Snapshot:\n${JSON.stringify(snapshot, null, 2)}\n\nQuestion: ${question}`;
-  return callClaude(ASK_SYSTEM + currency, prompt, 400);
+You will be given a JSON snapshot of REAL, already-computed numbers for this business, including weekly/monthly sales, expenses, profit, top products, customer debts, inventory, and estimated cash on hand.
+
+Answer using ONLY the numbers in the snapshot.
+
+Never invent or estimate a number that isn't there.
+
+If the snapshot doesn't contain what's needed to answer the question, say so plainly.
+
+Keep answers short — 2-4 sentences.
+
+Use plain language and no unnecessary jargon.
+
+Currency symbol to use: `;
+
+export async function answerQuestion(
+  question,
+  snapshot,
+  currency = "K"
+) {
+  const prompt = `Snapshot:
+${JSON.stringify(snapshot, null, 2)}
+
+Question: ${question}`;
+
+  return callGemini(
+    ASK_SYSTEM + currency,
+    prompt,
+    400
+  );
 }
