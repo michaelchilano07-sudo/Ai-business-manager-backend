@@ -55,7 +55,12 @@ app.post("/api/billing/webhook", express.raw({ type: "application/json" }), (req
 });
 
 app.use(helmet());
-app.use(cors({ origin: process.env.APP_URL || "*" }));
+app.use(
+  cors({
+    origin: true,
+    credentials: true,
+  })
+);
 app.use(express.json());
 
 const aiLimiter = rateLimit({ windowMs: 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false });
