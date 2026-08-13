@@ -203,4 +203,7 @@ app.get("/", (req, res) => {
   });
 });
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`AI Business Manager backend running on :${port}`));
+
+app.listen(port, "0.0.0.0", () => {
+  console.log(`AI Business Manager backend running on :${port}`);
+});
