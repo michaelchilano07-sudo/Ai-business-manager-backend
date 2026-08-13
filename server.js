@@ -55,9 +55,22 @@ app.post("/api/billing/webhook", express.raw({ type: "application/json" }), (req
 });
 
 app.use(helmet());
+app.use(helmet());
+
+const allowedOrigins = [
+  "https://ai-business-manager-frontend-azfs.vercel.app",
+  "http://localhost:5173",
+];
+
 app.use(
   cors({
-    origin: true,
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("Not allowed by CORS"));
+      }
+    },
     credentials: true,
   })
 );
