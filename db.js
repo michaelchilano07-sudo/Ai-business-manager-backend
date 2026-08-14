@@ -1,8 +1,20 @@
 import Database from "better-sqlite3";
+import fs from "node:fs";
+import path from "node:path";
 
-// A single file on disk — persists across restarts, no separate DB server needed.
-// For >1 server instance or heavier load, swap this file for Postgres (schema translates directly).
-const db = new Database("bizmanager.sqlite");
+const dataDir = process.env.DATA_DIR || "./data";
+
+fs.mkdirSync(dataDir, {
+  recursive: true,
+});
+
+const dbPath = path.join(
+  dataDir,
+  "bizmanager.sqlite"
+);
+
+const db = new Database(dbPath);
+
 db.pragma("journal_mode = WAL");
 
 db.exec(`
