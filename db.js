@@ -1,189 +1,750 @@
-import Database from "better-sqlite3";
-import fs from "node:fs";
-import path from "node:path";
+import { neon } from "@neondatabase/serverless";
 
-const dataDir = process.env.DATA_DIR || "./data";
+const DATABASE_URL =
+  process.env.DATABASE_URL;
 
-fs.mkdirSync(dataDir, {
-  recursive: true,
-});
-
-const dbPath = path.join(
-  dataDir,
-  "bizmanager.sqlite"
-);
-
-const db = new Database(dbPath);
-
-db.pragma("journal_mode = WAL");
-
-db.exec(`
-CREATE TABLE IF NOT EXISTS businesses (
-  id TEXT PRIMARY KEY,
-  email TEXT UNIQUE NOT NULL,
-  name TEXT,
-  plan TEXT NOT NULL DEFAULT 'free',
-  stripe_customer_id TEXT,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS transactions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  business_id TEXT NOT NULL,
-  type TEXT NOT NULL,             -- 'sale' | 'expense' | 'purchase'
-  item TEXT,
-  quantity REAL,
-  unit_price REAL,
-  total REAL NOT NULL DEFAULT 0,
-  amount_paid REAL NOT NULL DEFAULT 0,
-  customer_name TEXT,
-  raw_text TEXT,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  FOREIGN KEY (business_id) REFERENCES businesses(id)
-);
-
-CREATE TABLE IF NOT EXISTS inventory (
-  business_id TEXT NOT NULL,
-  item TEXT NOT NULL,
-  quantity REAL NOT NULL DEFAULT 0,
-  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-  PRIMARY KEY (business_id, item)
-);
-
-CREATE TABLE IF NOT EXISTS customers (
-  business_id TEXT NOT NULL,
-  name TEXT NOT NULL,
-  total_debt REAL NOT NULL DEFAULT 0,
-  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-  PRIMARY KEY (business_id, name)
-);
-`);
-
-// --- Businesses -----------------------------------------------------------
-export function getOrCreateBusiness(email, name) {
-  const existing = db.prepare("SELECT * FROM businesses WHERE email = ?").get(email);
-  if (existing) return existing;
-  const id = Buffer.from(email).toString("base64url");
-  db.prepare("INSERT INTO businesses (id, email, name) VALUES (?, ?, ?)").run(id, email, name || email.split("@")[0]);
-  return db.prepare("SELECT * FROM businesses WHERE id = ?").get(id);
-}
-
-export function getBusiness(id) {
-  return db.prepare("SELECT * FROM businesses WHERE id = ?").get(id);
-}
-
-export function setBusinessPlan(id, plan) {
-  db.prepare("UPDATE businesses SET plan = ? WHERE id = ?").run(plan, id);
-}
-
-export function setStripeCustomer(id, stripeCustomerId) {
-  db.prepare("UPDATE businesses SET stripe_customer_id = ? WHERE id = ?").run(stripeCustomerId, id);
-}
-
-export function findBusinessByStripeCustomer(stripeCustomerId) {
-  return db.prepare("SELECT * FROM businesses WHERE stripe_customer_id = ?").get(stripeCustomerId);
-}
-
-export function getAllBusinesses() {
-  return db.prepare("SELECT * FROM businesses ORDER BY created_at DESC").all();
-}
-
-// --- Transactions + side effects (inventory, debt) -------------------------
-export function recordTransaction(businessId, parsed, rawText) {
-  const { type, item, quantity, unit_price, total, amount_paid, customer_name } = parsed;
-
-  const insert = db.prepare(`
-    INSERT INTO transactions (business_id, type, item, quantity, unit_price, total, amount_paid, customer_name, raw_text)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const result = insert.run(
-    businessId, type, item || null, quantity || null, unit_price || null,
-    total || 0, amount_paid || 0, customer_name || null, rawText
+if (!DATABASE_URL) {
+  console.warn(
+    "WARNING: DATABASE_URL is not configured."
   );
+}
 
-  if (item && (type === "sale" || type === "purchase")) {
-    const delta = type === "sale" ? -(quantity || 0) : (quantity || 0);
-    const row = db.prepare("SELECT quantity FROM inventory WHERE business_id = ? AND item = ?").get(businessId, item);
-    const newQty = (row?.quantity || 0) + delta;
-    db.prepare(`
-      INSERT INTO inventory (business_id, item, quantity, updated_at) VALUES (?, ?, ?, datetime('now'))
-      ON CONFLICT(business_id, item) DO UPDATE SET quantity = ?, updated_at = datetime('now')
-    `).run(businessId, item, newQty, newQty);
+const sql = neon(
+  DATABASE_URL || ""
+);
+
+/* =========================================================
+   DATABASE INITIALIZATION
+========================================================= */
+
+let initializationPromise = null;
+
+async function initializeDatabase() {
+  if (!DATABASE_URL) {
+    throw new Error(
+      "DATABASE_URL is not configured."
+    );
   }
 
-  if (type === "sale" && customer_name) {
-    const debtDelta = (total || 0) - (amount_paid || 0);
+  await sql`
+    CREATE TABLE IF NOT EXISTS businesses (
+      id TEXT PRIMARY KEY,
+      email TEXT UNIQUE NOT NULL,
+      name TEXT,
+      plan TEXT NOT NULL DEFAULT 'free',
+      stripe_customer_id TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `;
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS transactions (
+      id BIGSERIAL PRIMARY KEY,
+      business_id TEXT NOT NULL REFERENCES businesses(id),
+      type TEXT NOT NULL,
+      item TEXT,
+      quantity DOUBLE PRECISION,
+      unit_price DOUBLE PRECISION,
+      total DOUBLE PRECISION NOT NULL DEFAULT 0,
+      amount_paid DOUBLE PRECISION NOT NULL DEFAULT 0,
+      customer_name TEXT,
+      raw_text TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `;
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS inventory (
+      business_id TEXT NOT NULL,
+      item TEXT NOT NULL,
+      quantity DOUBLE PRECISION NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (business_id, item),
+      FOREIGN KEY (business_id)
+        REFERENCES businesses(id)
+        ON DELETE CASCADE
+    )
+  `;
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS customers (
+      business_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      total_debt DOUBLE PRECISION NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (business_id, name),
+      FOREIGN KEY (business_id)
+        REFERENCES businesses(id)
+        ON DELETE CASCADE
+    )
+  `;
+
+  await sql`
+    CREATE INDEX IF NOT EXISTS idx_transactions_business
+    ON transactions(business_id)
+  `;
+
+  await sql`
+    CREATE INDEX IF NOT EXISTS idx_transactions_created
+    ON transactions(created_at)
+  `;
+
+  await sql`
+    CREATE INDEX IF NOT EXISTS idx_transactions_business_created
+    ON transactions(business_id, created_at)
+  `;
+}
+
+async function ensureDatabase() {
+  if (!initializationPromise) {
+    initializationPromise =
+      initializeDatabase().catch(
+        (error) => {
+          initializationPromise = null;
+          throw error;
+        }
+      );
+  }
+
+  return initializationPromise;
+}
+
+/* =========================================================
+   BUSINESSES
+========================================================= */
+
+export async function getOrCreateBusiness(
+  email,
+  name
+) {
+  await ensureDatabase();
+
+  const existing =
+    await sql`
+      SELECT *
+      FROM businesses
+      WHERE email = ${email}
+      LIMIT 1
+    `;
+
+  if (existing.length > 0) {
+    return existing[0];
+  }
+
+  const id =
+    Buffer.from(email)
+      .toString("base64url");
+
+  const businessName =
+    name ||
+    email.split("@")[0];
+
+  await sql`
+    INSERT INTO businesses (
+      id,
+      email,
+      name
+    )
+    VALUES (
+      ${id},
+      ${email},
+      ${businessName}
+    )
+    ON CONFLICT (email)
+    DO NOTHING
+  `;
+
+  const created =
+    await sql`
+      SELECT *
+      FROM businesses
+      WHERE email = ${email}
+      LIMIT 1
+    `;
+
+  return created[0];
+}
+
+export async function getBusiness(
+  id
+) {
+  await ensureDatabase();
+
+  const result =
+    await sql`
+      SELECT *
+      FROM businesses
+      WHERE id = ${id}
+      LIMIT 1
+    `;
+
+  return result[0] || null;
+}
+
+export async function setBusinessPlan(
+  id,
+  plan
+) {
+  await ensureDatabase();
+
+  await sql`
+    UPDATE businesses
+    SET plan = ${plan}
+    WHERE id = ${id}
+  `;
+}
+
+export async function setStripeCustomer(
+  id,
+  stripeCustomerId
+) {
+  await ensureDatabase();
+
+  await sql`
+    UPDATE businesses
+    SET stripe_customer_id =
+      ${stripeCustomerId}
+    WHERE id = ${id}
+  `;
+}
+
+export async function findBusinessByStripeCustomer(
+  stripeCustomerId
+) {
+  await ensureDatabase();
+
+  const result =
+    await sql`
+      SELECT *
+      FROM businesses
+      WHERE stripe_customer_id =
+        ${stripeCustomerId}
+      LIMIT 1
+    `;
+
+  return result[0] || null;
+}
+
+export async function getAllBusinesses() {
+  await ensureDatabase();
+
+  return await sql`
+    SELECT *
+    FROM businesses
+    ORDER BY created_at DESC
+  `;
+}
+
+/* =========================================================
+   TRANSACTIONS
+========================================================= */
+
+export async function recordTransaction(
+  businessId,
+  parsed,
+  rawText
+) {
+  await ensureDatabase();
+
+  const {
+    type,
+    item,
+    quantity,
+    unit_price,
+    total,
+    amount_paid,
+    customer_name,
+  } = parsed;
+
+  const safeQuantity =
+    Number.isFinite(
+      Number(quantity)
+    )
+      ? Number(quantity)
+      : 0;
+
+  const safeUnitPrice =
+    Number.isFinite(
+      Number(unit_price)
+    )
+      ? Number(unit_price)
+      : 0;
+
+  const safeTotal =
+    Number.isFinite(
+      Number(total)
+    )
+      ? Number(total)
+      : 0;
+
+  const safeAmountPaid =
+    Number.isFinite(
+      Number(amount_paid)
+    )
+      ? Number(amount_paid)
+      : 0;
+
+  const transaction =
+    await sql`
+      INSERT INTO transactions (
+        business_id,
+        type,
+        item,
+        quantity,
+        unit_price,
+        total,
+        amount_paid,
+        customer_name,
+        raw_text
+      )
+      VALUES (
+        ${businessId},
+        ${type},
+        ${item || null},
+        ${safeQuantity || null},
+        ${safeUnitPrice || null},
+        ${safeTotal},
+        ${safeAmountPaid},
+        ${customer_name || null},
+        ${rawText}
+      )
+      RETURNING id
+    `;
+
+  /*
+   * Inventory
+   */
+
+  if (
+    item &&
+    (type === "sale" ||
+      type === "purchase")
+  ) {
+    const delta =
+      type === "sale"
+        ? -safeQuantity
+        : safeQuantity;
+
+    const inventory =
+      await sql`
+        SELECT quantity
+        FROM inventory
+        WHERE business_id =
+          ${businessId}
+        AND item = ${item}
+        LIMIT 1
+      `;
+
+    const currentQuantity =
+      inventory.length > 0
+        ? Number(
+            inventory[0].quantity
+          )
+        : 0;
+
+    const newQuantity =
+      currentQuantity + delta;
+
+    await sql`
+      INSERT INTO inventory (
+        business_id,
+        item,
+        quantity,
+        updated_at
+      )
+      VALUES (
+        ${businessId},
+        ${item},
+        ${newQuantity},
+        NOW()
+      )
+      ON CONFLICT (
+        business_id,
+        item
+      )
+      DO UPDATE SET
+        quantity =
+          EXCLUDED.quantity,
+        updated_at = NOW()
+    `;
+  }
+
+  /*
+   * Customer debt
+   */
+
+  if (
+    type === "sale" &&
+    customer_name
+  ) {
+    const debtDelta =
+      safeTotal -
+      safeAmountPaid;
+
     if (debtDelta !== 0) {
-      const row = db.prepare("SELECT total_debt FROM customers WHERE business_id = ? AND name = ?").get(businessId, customer_name);
-      const newDebt = (row?.total_debt || 0) + debtDelta;
-      db.prepare(`
-        INSERT INTO customers (business_id, name, total_debt, updated_at) VALUES (?, ?, ?, datetime('now'))
-        ON CONFLICT(business_id, name) DO UPDATE SET total_debt = ?, updated_at = datetime('now')
-      `).run(businessId, customer_name, newDebt, newDebt);
+      const customer =
+        await sql`
+          SELECT total_debt
+          FROM customers
+          WHERE business_id =
+            ${businessId}
+          AND name =
+            ${customer_name}
+          LIMIT 1
+        `;
+
+      const currentDebt =
+        customer.length > 0
+          ? Number(
+              customer[0].total_debt
+            )
+          : 0;
+
+      const newDebt =
+        currentDebt +
+        debtDelta;
+
+      await sql`
+        INSERT INTO customers (
+          business_id,
+          name,
+          total_debt,
+          updated_at
+        )
+        VALUES (
+          ${businessId},
+          ${customer_name},
+          ${newDebt},
+          NOW()
+        )
+        ON CONFLICT (
+          business_id,
+          name
+        )
+        DO UPDATE SET
+          total_debt =
+            EXCLUDED.total_debt,
+          updated_at = NOW()
+      `;
     }
   }
 
-  return result.lastInsertRowid;
+  return Number(
+    transaction[0].id
+  );
 }
 
-export function getTransactionCountThisMonth(businessId) {
-  const row = db.prepare(`
-    SELECT COUNT(*) as n FROM transactions
-    WHERE business_id = ? AND created_at >= datetime('now', 'start of month')
-  `).get(businessId);
-  return row.n;
+/* =========================================================
+   MONTHLY TRANSACTION COUNT
+========================================================= */
+
+export async function getTransactionCountThisMonth(
+  businessId
+) {
+  await ensureDatabase();
+
+  const result =
+    await sql`
+      SELECT COUNT(*)::int AS count
+      FROM transactions
+      WHERE business_id =
+        ${businessId}
+      AND created_at >=
+        DATE_TRUNC(
+          'month',
+          NOW()
+        )
+    `;
+
+  return Number(
+    result[0]?.count || 0
+  );
 }
 
-// --- Reporting / snapshot for the AI to answer questions from ---------------
-export function getSnapshot(businessId) {
-  const sumSince = (since, type) =>
-    db.prepare(`SELECT COALESCE(SUM(total),0) as s FROM transactions WHERE business_id = ? AND type = ? AND created_at >= ?`)
-      .get(businessId, type, since).s;
+/* =========================================================
+   SNAPSHOT
+========================================================= */
 
-  const now = new Date();
-  const startOfWeek = new Date(now); startOfWeek.setDate(now.getDate() - now.getDay());
-  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-  const weekIso = startOfWeek.toISOString().slice(0, 10);
-  const monthIso = startOfMonth.toISOString().slice(0, 10);
+export async function getSnapshot(
+  businessId
+) {
+  await ensureDatabase();
 
-  const weekSales = sumSince(weekIso, "sale");
-  const weekExpenses = sumSince(weekIso, "expense") + sumSince(weekIso, "purchase");
-  const monthSales = sumSince(monthIso, "sale");
-  const monthExpenses = sumSince(monthIso, "expense") + sumSince(monthIso, "purchase");
+  const weekSales =
+    await sql`
+      SELECT COALESCE(
+        SUM(total),
+        0
+      ) AS total
+      FROM transactions
+      WHERE business_id =
+        ${businessId}
+      AND type = 'sale'
+      AND created_at >=
+        DATE_TRUNC(
+          'week',
+          NOW()
+        )
+    `;
 
-  const topProducts = db.prepare(`
-    SELECT item, SUM(quantity) as qty, SUM(total) as revenue
-    FROM transactions WHERE business_id = ? AND type = 'sale' AND item IS NOT NULL
-    GROUP BY item ORDER BY qty DESC LIMIT 5
-  `).all(businessId);
+  const weekExpenses =
+    await sql`
+      SELECT COALESCE(
+        SUM(total),
+        0
+      ) AS total
+      FROM transactions
+      WHERE business_id =
+        ${businessId}
+      AND type IN (
+        'expense',
+        'purchase'
+      )
+      AND created_at >=
+        DATE_TRUNC(
+          'week',
+          NOW()
+        )
+    `;
 
-  const debts = db.prepare(`
-    SELECT name, total_debt FROM customers WHERE business_id = ? AND total_debt > 0 ORDER BY total_debt DESC
-  `).all(businessId);
+  const monthSales =
+    await sql`
+      SELECT COALESCE(
+        SUM(total),
+        0
+      ) AS total
+      FROM transactions
+      WHERE business_id =
+        ${businessId}
+      AND type = 'sale'
+      AND created_at >=
+        DATE_TRUNC(
+          'month',
+          NOW()
+        )
+    `;
 
-  const inventory = db.prepare(`
-    SELECT item, quantity FROM inventory WHERE business_id = ? ORDER BY item
-  `).all(businessId);
+  const monthExpenses =
+    await sql`
+      SELECT COALESCE(
+        SUM(total),
+        0
+      ) AS total
+      FROM transactions
+      WHERE business_id =
+        ${businessId}
+      AND type IN (
+        'expense',
+        'purchase'
+      )
+      AND created_at >=
+        DATE_TRUNC(
+          'month',
+          NOW()
+        )
+    `;
 
-  const cashOnHand = db.prepare(`
-    SELECT COALESCE(SUM(amount_paid),0) as paid_in, 
-           (SELECT COALESCE(SUM(total),0) FROM transactions WHERE business_id = ? AND type IN ('expense','purchase')) as paid_out
-    FROM transactions WHERE business_id = ? AND type = 'sale'
-  `).get(businessId, businessId);
+  const topProducts =
+    await sql`
+      SELECT
+        item,
+        COALESCE(
+          SUM(quantity),
+          0
+        ) AS qty,
+        COALESCE(
+          SUM(total),
+          0
+        ) AS revenue
+      FROM transactions
+      WHERE business_id =
+        ${businessId}
+      AND type = 'sale'
+      AND item IS NOT NULL
+      GROUP BY item
+      ORDER BY qty DESC
+      LIMIT 5
+    `;
+
+  const debts =
+    await sql`
+      SELECT
+        name,
+        total_debt
+      FROM customers
+      WHERE business_id =
+        ${businessId}
+      AND total_debt > 0
+      ORDER BY total_debt DESC
+    `;
+
+  const inventory =
+    await sql`
+      SELECT
+        item,
+        quantity
+      FROM inventory
+      WHERE business_id =
+        ${businessId}
+      ORDER BY item
+    `;
+
+  const cash =
+    await sql`
+      SELECT
+        COALESCE(
+          (
+            SELECT SUM(amount_paid)
+            FROM transactions
+            WHERE business_id =
+              ${businessId}
+            AND type = 'sale'
+          ),
+          0
+        ) AS paid_in,
+
+        COALESCE(
+          (
+            SELECT SUM(total)
+            FROM transactions
+            WHERE business_id =
+              ${businessId}
+            AND type IN (
+              'expense',
+              'purchase'
+            )
+          ),
+          0
+        ) AS paid_out
+    `;
+
+  const weekSalesValue =
+    Number(
+      weekSales[0]?.total || 0
+    );
+
+  const weekExpensesValue =
+    Number(
+      weekExpenses[0]?.total ||
+        0
+    );
+
+  const monthSalesValue =
+    Number(
+      monthSales[0]?.total || 0
+    );
+
+  const monthExpensesValue =
+    Number(
+      monthExpenses[0]?.total ||
+        0
+    );
+
+  const totalDebt =
+    debts.reduce(
+      (sum, debt) =>
+        sum +
+        Number(
+          debt.total_debt || 0
+        ),
+      0
+    );
+
+  const paidIn =
+    Number(
+      cash[0]?.paid_in || 0
+    );
+
+  const paidOut =
+    Number(
+      cash[0]?.paid_out || 0
+    );
 
   return {
-    week: { sales: weekSales, expenses: weekExpenses, profit: weekSales - weekExpenses },
-    month: { sales: monthSales, expenses: monthExpenses, profit: monthSales - monthExpenses },
-    topProducts,
-    debts,
-    totalDebt: debts.reduce((s, d) => s + d.total_debt, 0),
-    inventory,
-    estimatedCash: (cashOnHand.paid_in || 0) - (cashOnHand.paid_out || 0),
+    week: {
+      sales:
+        weekSalesValue,
+
+      expenses:
+        weekExpensesValue,
+
+      profit:
+        weekSalesValue -
+        weekExpensesValue,
+    },
+
+    month: {
+      sales:
+        monthSalesValue,
+
+      expenses:
+        monthExpensesValue,
+
+      profit:
+        monthSalesValue -
+        monthExpensesValue,
+    },
+
+    topProducts:
+      topProducts.map(
+        (product) => ({
+          item: product.item,
+          qty: Number(
+            product.qty || 0
+          ),
+          revenue: Number(
+            product.revenue || 0
+          ),
+        })
+      ),
+
+    debts:
+      debts.map((debt) => ({
+        name: debt.name,
+        total_debt: Number(
+          debt.total_debt || 0
+        ),
+      })),
+
+    totalDebt,
+
+    inventory:
+      inventory.map((row) => ({
+        item: row.item,
+        quantity: Number(
+          row.quantity || 0
+        ),
+      })),
+
+    estimatedCash:
+      paidIn - paidOut,
   };
 }
 
-export function getRecentTransactions(businessId, limit = 20) {
-  return db.prepare(`SELECT * FROM transactions WHERE business_id = ? ORDER BY created_at DESC LIMIT ?`).all(businessId, limit);
-}
+/* =========================================================
+   RECENT TRANSACTIONS
+========================================================= */
 
-export default db;
+export async function getRecentTransactions(
+  businessId,
+  limit = 20
+) {
+  await ensureDatabase();
+
+  const safeLimit = Math.min(
+    Math.max(
+      Number(limit) || 20,
+      1
+    ),
+    100
+  );
+
+  return await sql`
+    SELECT *
+    FROM transactions
+    WHERE business_id =
+      ${businessId}
+    ORDER BY created_at DESC
+    LIMIT ${safeLimit}
+  `;
+}
